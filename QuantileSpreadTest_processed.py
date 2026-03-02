@@ -3,8 +3,10 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')  # 设置后端
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
+import statsmodels.api as sm
+from statsmodels.stats.sandwich_covariance import cov_hac
 from scipy import stats
+from sklearn.linear_model import LinearRegression
 from factor_validation_config_loader import traget_factor, layers, holding_period, test_window_start, test_window_end
 
 # --- 设置 Pandas 显示选项 ---
@@ -13,7 +15,9 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
 pd.set_option('display.max_colwidth', None)
 
+# ─────────────────────────────────────────────────────────────────────────────
 # 加载数据
+# ─────────────────────────────────────────────────────────────────────────────
 def data_loading(traget_factor):
     print(f"开始分析因子: {traget_factor}")
     base_directory = r'C:\Users\63585\Desktop\PycharmProjects\pythonProject\QuantSystem\WorldQuant_Alpha101'
@@ -26,7 +30,9 @@ def data_loading(traget_factor):
                         usecols=['trade_date', 'ts_code', 'circ_mv'])
     df_merge = df_loading.merge(cv_df,on=['trade_date','ts_code'],how='left')
     return df_merge
+# ─────────────────────────────────────────────────────────────────────────────
 # 筛选时间窗口
+# ─────────────────────────────────────────────────────────────────────────────
 def cut_time_window(df, start_time, end_time):
     try:
         # 预处理原始数据的日期列
@@ -78,7 +84,9 @@ def cut_time_window(df, start_time, end_time):
         print(f"处理时间窗口时发生错误: {e}")
         print("--- 程序终止 ---")
         return None # 返回 None 表示操作失败
+# ─────────────────────────────────────────────────────────────────────────────
 # 持有期内累计对数收益率计算
+# ─────────────────────────────────────────────────────────────────────────────
 def data_preprocessing(df,test_window_start,test_window_end, holding_period):
     df = df.copy()
     # 截取回测期间的历史数据
@@ -92,7 +100,9 @@ def data_preprocessing(df,test_window_start,test_window_end, holding_period):
     )
     df_preprocess = df_preprocess.dropna(subset=['holding_lndret'])
     return df_preprocess
+# ─────────────────────────────────────────────────────────────────────────────
 # 市值/行业中性化处理
+# ─────────────────────────────────────────────────────────────────────────────
 def neutralize_factor_by_date(group, factor_col='alpha_15', cap_col='circ_mv', industry_col='industry_name'):
     """
     Factor ~ ln(MarketCap) + Industry_Dummies，返回残差作为中性化后的因子值
@@ -123,7 +133,9 @@ def neutralize_factor_by_date(group, factor_col='alpha_15', cap_col='circ_mv', i
     group['factor_neutralized'] = np.nan
     group.loc[valid_mask, 'factor_neutralized'] = residuals
     return group
+# ─────────────────────────────────────────────────────────────────────────────
 # 计算每层收益均值
+# ─────────────────────────────────────────────────────────────────────────────
 def process_group_by_date(group, layers):
     # 按中性化之后的因子值对当前分组进行排序(从小到大升序排列，负向信号在前group_0,正向信号在后group_5)
     sorted_group = group.sort_values(by='factor_neutralized', ascending=False).reset_index(drop=True)
@@ -146,7 +158,9 @@ def process_group_by_date(group, layers):
     sorted_group['mean_lndret'] = sorted_group.groupby('quantile')['holding_lndret'].transform('mean')
 
     return sorted_group
+# ─────────────────────────────────────────────────────────────────────────────
 # group累计对数收益计算
+# ─────────────────────────────────────────────────────────────────────────────
 def spread_ret_cumsum_calculate(data, layers):
     # pivot_table数据透视
     Spread_ret = data.pivot_table(
@@ -180,38 +194,74 @@ def spread_ret_cumsum_calculate(data, layers):
             print(f"警告: 未能找到累计收益列 '{sum_ret_col_name}' 来提取最终收益。")
 
     return Spread_ret, t_test_series, final_cumulative_returns
-# L-S收益率的t检验
+# ─────────────────────────────────────────────────────────────────────────────
+# L-S收益率的t检验（Newey-West调整）
+# ─────────────────────────────────────────────────────────────────────────────
 def t_test_spread_ret(Series):
-    # 只关心是否大于0，应是单尾检验
-    t_stat, two_tailed_p_value = stats.ttest_1samp(Series, 0.0)
-    ''' 
-    --- 单尾检验逻辑 ---
-    我们的原假设 H0: mean <= 0, 备择假设 H1: mean > 0
-    1. 如果 t_stat < 0，说明样本均值小于0，肯定不支持 H1。
-        此时 p-value 应为 1 - (two_tailed_p_value / 2)，肯定远大于 0.05。
-    2. 如果 t_stat > 0，说明样本均值大于0，支持 H1 的方向。
-        此时 p-value 应为 two_tailed_p_value / 2。
-    只关心 t_stat > 0 且 p-value < 0.05 的情况。
-    '''
+    """
+    对多空收益序列进行 Newey-West 调整的 t 检验 (单尾)
+    使用 statsmodels 计算 HAC 标准误以确保精度
+    """
+    # 数据预处理
+    if hasattr(Series, 'values'):
+        rets = Series.values
+    else:
+        rets = np.array(Series)
+    # 去除 NaN 值
+    rets = rets[~np.isnan(rets)]
+    T = len(rets)
+    if T < 5:
+        print("样本量过小，无法进行 Newey-West 调整。")
+        return False
+
+    mean_ret = np.mean(rets)
+    
+    # 构建截距模型: Y = alpha + error
+    # 这里的 alpha 就是均值 mean_ret
+    X = np.ones((T, 1)) 
+    model = sm.OLS(rets, X)
+    results = model.fit()
+    
+    # 调用 cov_hac 计算 Newey-West 协方差矩阵，nlags=None 表示让库函数自动根据公式选择滞后阶数
+    # 库函数内部会自动应用小样本修正因子 (n / (n-k))
+    cov_matrix = cov_hac(results, nlags=None)
+    
+    # 提取标准误 (协方差矩阵对角线元素的平方根)
+    # 因为是单变量回归，cov_matrix 是 1x1
+    se_nw = np.sqrt(cov_matrix[0, 0])
+    
+    # 查看库函数自动选择的滞后阶数，cov_hac 不直接返回使用的 lags，但逻辑与 floor(4*(T/100)^(2/9)) 一致
+    # lags_used = int(np.floor(4 * (T / 100)**(2/9)))
+    # lags_used = max(1, min(lags_used, T - 2))
+
+    # 计算统计量
+    if se_nw < 1e-10:
+        t_stat = 0.0
+    else:
+        t_stat = mean_ret / se_nw
+    # 计算双尾 p 值
+    two_tailed_p_value = 2 * (1 - stats.t.cdf(abs(t_stat), df=T-1))
+    # 单尾检验逻辑
     if t_stat > 0:
         one_tailed_p_value = two_tailed_p_value / 2
     else:
-        # t_stat <= 0 时，我们不拒绝 H0 (mean <= 0)，即认为不显著大于0
-        one_tailed_p_value = 1.0  # 可以写成 > 0.05 的任意值
+        one_tailed_p_value = 1.0
 
-    # 打印 t 统计量和 p-value
-    print(f"T-statistic: {t_stat:.4f}")
-    print(f"P-value (one-tailed): {one_tailed_p_value:.4f}")
-    # 根据 p-value 和 t-stat 判断并打印结论
+    # print(f"[NW Adjusted] Lags used: {lags_used}, T: {T}")
+    print(f"[NW Adjusted] T-statistic: {t_stat:.4f}")
+    print(f"[NW Adjusted] P-value (one-tailed): {one_tailed_p_value:.4f}")
+    
     alpha = 0.05
     if one_tailed_p_value < alpha and t_stat > 0:
-        conclusion = "多空组合收益率序列显著为正"
+        conclusion = "多空组合收益率序列显著为正 (Newey-West 调整)"
     else:
-        conclusion = "多空组合收益率序列不显著为正"
+        conclusion = "多空组合收益率序列不显著为正 (Newey-West 调整)"
     print(f"结论: {conclusion}")
-    # 返回检验结果
+    
     return one_tailed_p_value < 0.05
+# ─────────────────────────────────────────────────────────────────────────────
 # 分层回测结果绘图
+# ───────────────────────────────────────────────────────────────────────────── 
 def plot_multiple_return_metrics(dataframe, cumulative_returns, layers, target_factor):
     # 设置中文字体以支持中文
     plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']  # 优先使用黑体
@@ -292,8 +342,10 @@ def run():
     df_layers_cumulative_ret, spread_ret_series, final_cumulative_returns = spread_ret_cumsum_calculate(
         df_layers_processed, layers)
     print('分层收益计算完毕')
+    print('正在计算Newey—West调整后的 t 统计量')
     '''多空收益的t-检验'''
     t_test_spread_ret(spread_ret_series)
+    print('Newey—West调整后的 t 统计量计算完成')
     '''结果绘图'''
     plot_multiple_return_metrics(df_layers_cumulative_ret, final_cumulative_returns, layers, traget_factor)
 
