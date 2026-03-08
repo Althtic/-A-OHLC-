@@ -36,3 +36,7 @@ WQ101部分因子的计算过程，包括市值中性化，行业中性化等处
 添加了Fama-French 5因子模型中 SMB因子的完整计算过程，详情请见FF5_SMB.py文件
 
 QuantileSpreadTest.py中对持有期收益率做了日度化处理，解决了分组累加收益率虚高的bug
+
+2026/3/8更新
+
+系统完善了DataPipeline.py全流程，实现了从tushare原始数据到最终数据的一站化处理
