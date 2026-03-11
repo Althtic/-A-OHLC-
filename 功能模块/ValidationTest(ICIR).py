@@ -1,4 +1,5 @@
 import logging
+import warnings
 import pandas as pd
 import numpy as np
 import scipy.stats as stats
@@ -9,6 +10,7 @@ import statsmodels.api as sm
 from statsmodels.stats.sandwich_covariance import cov_hac
 from config_loader import traget_factor, test_window_start, test_window_end, test_period, ic_ma_period
 
+warnings.filterwarnings("ignore", category=FutureWarning)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.basicConfig(
     level=logging.INFO,
@@ -18,16 +20,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)  # 获取一个命名的 logger 实例
 
 # --- 设置 Pandas 显示选项 ---
-pd.set_option('display.max_columns', None) # 显示所有列
-pd.set_option('display.width', None)       # 取消换行（字符宽度限制）
-pd.set_option('display.max_colwidth', None)# 列宽无限制（防止单元格内容被截断）
+pd.set_option('display.max_columns', None)   # 显示所有列
+pd.set_option('display.width', None)         # 取消换行（字符宽度限制）
+pd.set_option('display.max_colwidth', None)  # 列宽无限制（防止单元格内容被截断）
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 加载数据
 # ─────────────────────────────────────────────────────────────────────────────
 def data_loading(traget_factor):
     logger.info(f"目标检测因子：{traget_factor}")
-    base_directory = r'C:\Users\63585\Desktop\PycharmProjects\pythonProject\QuantSystem\WorldQuant_Alpha101'
+    base_directory = r'C:\Users\63585\Desktop\PycharmProjects\pythonProject\QuantSystem\Factors'
     alpha = traget_factor
     filename = f"{alpha}.csv"
     Input_path = base_directory + '\\' + filename
@@ -86,8 +88,7 @@ def cut_time_window(df, start_time, end_time):
     except Exception as e:
         logger.info(f"处理时间窗口时发生错误: {e}")
 
-        return None 
-# ─────────────────────────────────────────────────────────────────────────────
+        return None
 # ─────────────────────────────────────────────────────────────────────────────
 # 持有期对数收益率计算, 后续将分别按照t期因子值与t+1期收益率进行排序
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,45 +112,73 @@ def factor_cumuret_rank(df, traget_factor, test_period):
     df_factor_ranking['factor_rank'] = df_factor_ranking.groupby('trade_date')[traget_factor].rank(pct=True)
     # 未来累计收益排序（升序），用于计算斯皮尔曼相关系数（RankIC）
     # rolling()的计算只能面向“过去”，所以需要提前翻转数据（日期翻转），使得rolling()函数可以直接计算未来收益
-    df_factor_ranking = df_factor_ranking.sort_values(by=['trade_date', 'ts_code'], ascending=[True, True])
-    # 计算未来test_period个交易日的收益累计和
+    df_factor_ranking = df_factor_ranking.sort_values(by=['trade_date', 'ts_code'], ascending=[False, True])
+   
+    # 计算未来持有test_period个交易日的收益累计和
     df_factor_ranking['period_cumu_lndret'] = df_factor_ranking.groupby('ts_code')['lndret'].transform(
         lambda x: x.shift(1).rolling(window = test_period).sum()
     )
+  
     df_cumu_dret_rank = df_factor_ranking.dropna(subset=['period_cumu_lndret'])
     # 数据顺序恢复原状(升序)
     df_cumu_dret_rank = df_cumu_dret_rank.sort_values(by=['trade_date', 'ts_code'], ascending=[True, True])
-    # 针对累计对数收益率rank排序
+    # 针对累计对数收益率与日度收益率进行截面rank排序
     df_cumu_dret_rank['cumu_lndret_rank'] = df_cumu_dret_rank.groupby('trade_date')['period_cumu_lndret'].rank(pct=True)
+    df_cumu_dret_rank['daily_cumu_lndret_rank'] = df_cumu_dret_rank.groupby('trade_date')['holding1D_lndret'].rank(pct=True)
     df_factor_cumuret_rank = df_cumu_dret_rank
+  
     return df_factor_cumuret_rank
 # ─────────────────────────────────────────────────────────────────────────────
 # RankIC, ICmean, ICIR及相关评价指标计算
 # ─────────────────────────────────────────────────────────────────────────────
-def IC_calculate(df, ic_ma_period):
-    df_ic_processing = df
+def IC_calculate(df, ic_ma_period, test_period):
+    df_ic_processing = df.copy()
     df_ic_processing['trade_date'] = pd.to_datetime(df_ic_processing['trade_date'])
-    # 斯皮尔曼相关系数(Rank_IC)值计算
+    # 持有期rank_IC（适配调仓频率）
     rank_ic_series = df_ic_processing.groupby('trade_date').apply(
         lambda x: x['factor_rank'].corr(x['cumu_lndret_rank']), include_groups=False
     )
-    # rank_ic有效性检验（单尾 > 0.05）
+    # 因子有效性评估
     ic_ttest_sample(rank_ic_series, threshold=0.05)
-    # IC累计和序列
+    # 计算累计IC及最大回撤 
     cumulative_ic_series = rank_ic_series.cumsum()
-    # IC均值计算(rolling)
-    ic_ma_series = rank_ic_series.rolling(window=ic_ma_period).mean()
-    # ICIR = IC.mean / IC.std
+    cumu_ic_running_max = cumulative_ic_series.cummax()
+    cumu_ic_drawdown = cumu_ic_running_max - cumulative_ic_series
+    cumu_ic_max_dd = cumu_ic_drawdown.max()
+    max_dd_date = cumu_ic_drawdown.idxmax()
+    cumu_ic_drawdown_ratio = cumu_ic_max_dd / cumu_ic_running_max.loc[max_dd_date]
+
+
+   
+    ic_ma_series = rank_ic_series.rolling(window=ic_ma_period, min_periods=test_period).mean()  # 持有期IC的滚动均值
     ICIR_value = rank_ic_series.mean() / rank_ic_series.std()
 
-    # 创建临时DataFrame存储计算结果
+    # IC衰减：各持有期限(1~test_period日)的截面IC均值
+    df_desc = df_ic_processing.sort_values(by=['trade_date', 'ts_code'], ascending=[False, True])
+    ic_decay = []
+    for h in range(1, test_period + 1):
+        cumu_h = df_desc.groupby('ts_code')['lndret'].transform(
+            lambda x, w=h: x.shift(1).rolling(window=w).sum()
+        )
+        df_h = df_desc.assign(_cumu=cumu_h).dropna(subset=['_cumu'])
+        df_h = df_h.sort_values(by=['trade_date', 'ts_code'], ascending=[True, True])
+        df_h['_rank'] = df_h.groupby('trade_date')['_cumu'].rank(pct=True)
+        ic_s = df_h.groupby('trade_date').apply(
+            lambda g: g['factor_rank'].corr(g['_rank']), include_groups=False
+        )
+        ic_decay.append(ic_s.mean())
+
     temp_df = pd.DataFrame({
         'trade_date': rank_ic_series.index,
         'Rank_IC': rank_ic_series.values,
         'Cumulative_IC': cumulative_ic_series.values,
+        'Cumulative_IC_MaxDD': [cumu_ic_max_dd] * len(rank_ic_series),
+        'MaxDD_Occur_Date': [max_dd_date] * len(rank_ic_series), 
+        'Cumulative_IC_MaxDD_Ratio': [cumu_ic_drawdown_ratio] * len(rank_ic_series),
         'IC_MA': ic_ma_series.values,
         'ICIR': [ICIR_value] * len(rank_ic_series),
     })
+
     # 计算每月的 Rank_IC 均值
     temp_df['year_month'] = temp_df['trade_date'].dt.to_period('M')  # e.g., '2024-08'
     monthly_means = temp_df.groupby('year_month')['Rank_IC'].mean()
@@ -164,21 +193,15 @@ def IC_calculate(df, ic_ma_period):
     temp_df['year'] = temp_df['trade_date'].dt.to_period('Y')  # e.g., '2024'
     yearly_means = temp_df.groupby('year')['Rank_IC'].mean()
     yearly_ICIR = temp_df.groupby('year').apply(
-        lambda x: x['Rank_IC'].mean()/x['Rank_IC'].std(), include_groups=False
+        lambda x: x['Rank_IC'].mean() / x['Rank_IC'].std(), include_groups=False
     )
     temp_df['Yearly_Rank_IC_Mean'] = temp_df['year'].map(yearly_means)
     temp_df['Yearly_ICIR'] = temp_df['year'].map(yearly_ICIR)
-    # final_df = temp_df.drop(columns=['year_month','year'])
-    # return final_df
-    return temp_df
+    return temp_df, ic_decay
 # ─────────────────────────────────────────────────────────────────────────────
 # IC序列的t检验（双尾检验), 需同样进行Newey-West调整自相关
 # ─────────────────────────────────────────────────────────────────────────────
 def ic_ttest_sample(rank_ic_series, threshold=0.05, alpha=0.05):
-    print("=" * 70)
-    print("IC 统计显著性检验结果 (Newey-West调整)")
-    print("=" * 70)
-    
     # 数据预处理
     if hasattr(rank_ic_series, 'values'):
         rank_ic_series = rank_ic_series.values
@@ -187,148 +210,82 @@ def ic_ttest_sample(rank_ic_series, threshold=0.05, alpha=0.05):
     n = len(rank_ic_series)
     
     if n < 5:
-        print("样本量不足 (N<5)，无法进行可靠的 Newey-West 调整")
-        return None
+        print("样本量不足 (N<5)，无法进行可靠检验。")
+        return {"t_stat": np.nan, "status": "invalid", "mean": np.nan, "se": np.nan}
 
-    # ==================== 使用 Newey-West 计算 SE 和 T 统计量 ====================
     # 构建截距模型 (Y = mean + error)
     X = np.ones((n, 1))
     model = sm.OLS(rank_ic_series, X)
     results = model.fit()
+    
+    lags_calc = int(np.floor(4 * (n / 100)**(2/9)))
+    # 安全约束: 
+    # 1. 至少为 1 (只要 n>1)
+    # 2. 不能超过 n-2 (保证自由度)，通常建议不超过 n/4 以避免过度平滑
+    lags_used = max(1, min(lags_calc, n - 2))
+
     # 计算 HAC (Newey-West) 协方差矩阵
-    cov_matrix = cov_hac(results, nlags=None)
-    # 提取 NW 标准误 (SE)
-    se_nw = np.sqrt(cov_matrix[0, 0])
-    # 计算均值和 IR
-    sample_mean = results.params[0] # 等同于 np.mean()
-    sample_std = rank_ic_series.std(ddof=1) # 描述性统计仍用普通标准差
-    # 计算 NW 调整后的 T 统计量 (针对 H0: mean = 0)
-    if se_nw < 1e-12:
-        t_stat_0 = 0.0
-    else:
-        t_stat_0 = sample_mean / se_nw
-        
-    # 计算双尾 P 值 (基于 t 分布，自由度 n-1)
-    # 虽然 NW 是渐近正态的，但在小样本下用 t 分布更保守
-    p_value_0 = 2 * (1 - stats.t.cdf(abs(t_stat_0), df=n-1))
+    try:
+        cov_matrix = cov_hac(results, nlags=lags_used)
+        se_nw = np.sqrt(cov_matrix[0, 0])
+    except Exception:
+        # 如果 NW 计算失败，回退到普通标准误
+        se_nw = results.bse[0]
+        lags_used = 0
+
+    sample_mean = results.params[0]
     
-    # 估算使用的 Lags 用于打印
-    lags_used = int(np.floor(4 * (n / 100)**(2/9)))
-    lags_used = max(1, min(lags_used, n-2))
-
-    # ==================== 描述性统计 ====================
-    # 打印 NW 调整后的 SE，以反映真实波动
-    print(f"【1. 描述性统计】")
-    print(f"   样本均值 (Mean IC):   {sample_mean:.4f}")
-    print(f"   样本标准差 (Std IC):  {sample_std:.4f}")
-    print(f"   标准误 (SE, NW 调整):  {se_nw:.4f}  (Lags={lags_used})")
-    print(f"   观测样本数 (N):       {n}")
-
-    # ==================== 检验 IC 是否显著不为 0 ====================
-    # 使用上面计算的 t_stat_0 和 p_value_0
-    t_critical_0 = stats.t.ppf(1 - alpha / 2, df=n - 1)
-    significant_0 = abs(t_stat_0) > t_critical_0
-
-    print(f"【2. IC 均值是否显著不为 0? ]")
-    print(f"   原假设 H0:  mean = 0")
-    print(f"   备择假设 H1:  mean ≠ 0")
-    print(f"   t-statistic (NW):     {t_stat_0:.4f}")
-    print(f"   |t|:                  {abs(t_stat_0):.4f}")
-    print(f"   t 临界值 (α={alpha}):    ±{t_critical_0:.4f}")
-    print(f"   p-value (双尾):       {p_value_0:.6f}")
-    print("-" * 70)
-
-    if significant_0:
-        if t_stat_0 > 0:
-            print(f"   |t| = {abs(t_stat_0):.4f} > {t_critical_0:.4f}")
-            print(f"   结论：IC 均值显著为正（因子正向有效）")
-            direction_0 = "positive"
+    if se_nw < 1e-12:
+        t_stat = 0.0
+    else:
+        t_stat = sample_mean / se_nw
+    
+    # 判断逻辑
+    t_critical = stats.t.ppf(1 - alpha / 2, df=n - 1)
+    is_significant = abs(t_stat) > t_critical
+    
+    status = "invalid"
+    
+    if not is_significant:
+        status = "invalid"
+    else:
+        if se_nw >= 1e-12:
+            # 检验是否显著大于 threshold
+            t_stat_upper = (sample_mean - threshold) / se_nw
+            p_upper = 1 - stats.t.cdf(t_stat_upper, df=n - 1)
+            is_strong_positive = p_upper < alpha
+            
+            # 检验是否显著小于 -threshold
+            t_stat_lower = (sample_mean + threshold) / se_nw
+            p_lower = stats.t.cdf(t_stat_lower, df=n - 1)
+            is_strong_negative = p_lower < alpha
         else:
-            print(f"   |t| = {abs(t_stat_0):.4f} > {t_critical_0:.4f}")
-            print(f"   结论：IC 均值显著为负（因子反向有效）")
-            direction_0 = "negative"
-    else:
-        print(f"   |t| = {abs(t_stat_0):.4f} < {t_critical_0:.4f}")
-        print(f"   结论：IC 均值不显著异于 0（因子无效）")
-        direction_0 = "not_significant"
+            is_strong_positive = False
+            is_strong_negative = False
+            
+        if is_strong_positive:
+            status = "strong_positive"
+        elif is_strong_negative:
+            status = "strong_negative"
+        else:
+            status = "normal"
 
-    # ==================== 检验 IC 是否显著大于 threshold 或小于 -threshold ====================
-    # T 统计量 = (Sample_Mean - Hypothesized_Mean) / SE_NW
-    # SE_NW 是在 H0: mean=0 下估计的长程方差，通常也用于局部假设检验
+    print(f"T-Stat (NW): {t_stat:.4f} | Mean: {sample_mean:.4f} | SE: {se_nw:.4f} | Status: {status}")
     
-    # 3.1 检验是否显著大于 threshold (H0: mean <= threshold)
-    # t_stat = (mean - threshold) / se_nw
-    if se_nw < 1e-12:
-        t_stat_upper = 0.0
+    if status == "strong_positive":
+        print("结论：强有效正向因子")
+    elif status == "strong_negative":
+        print("结论：强有效反向因子")
+    elif status == "normal":
+        print("结论：普通有效因子（显著异于 0 但未突破阈值）")
     else:
-        t_stat_upper = (sample_mean - threshold) / se_nw
-        
-    # 计算双尾 p 值以便转换
-    _, p_value_upper_two_dummy = stats.ttest_1samp(rank_ic_series, threshold) # 这个 p 值不准，仅为了占位或不用
-    # 手动计算基于 NW SE 的双尾 p 值
-    p_val_two_tail_upper = 2 * (1 - stats.t.cdf(abs(t_stat_upper), df=n-1))
-    
-    # 单尾检验 (H1: mean > threshold)
-    if t_stat_upper > 0:
-        p_value_upper = p_val_two_tail_upper / 2
-    else:
-        p_value_upper = 1.0
-    significant_upper = p_value_upper < alpha
-
-    # 3.2 检验是否显著小于 -threshold (H0: mean >= -threshold)
-    if se_nw < 1e-12:
-        t_stat_lower = 0.0
-    else:
-        t_stat_lower = (sample_mean - (-threshold)) / se_nw
-        
-    p_val_two_tail_lower = 2 * (1 - stats.t.cdf(abs(t_stat_lower), df=n-1))
-    
-    # 单尾检验 (H1: mean < -threshold)
-    if t_stat_lower < 0:
-        p_value_lower = p_val_two_tail_lower / 2
-    else:
-        p_value_lower = 1.0
-    significant_lower = p_value_lower < alpha
-
-    print(f"【3. IC 均值是否显著大于 {threshold} 或小于 {-threshold}？(NW 调整)]")
-    print(f"   阈值范围：[-{threshold}, {threshold}]")
-    print("-" * 70)
-
-    # 检验是否显著大于 threshold
-    print(f"   (a) 检验是否显著大于 {threshold}:")
-    print(f"       原假设 H0:  mean ≤ {threshold}")
-    print(f"       备择假设 H1:  mean > {threshold}")
-    print(f"       t-statistic (NW): {t_stat_upper:.4f}")
-    print(f"       p-value (单尾):   {p_value_upper:.6f}")
-    if significant_upper:
-        print(f"       结论：IC 均值显著大于 {threshold}")
-    else:
-        print(f"       结论：IC 均值不显著大于 {threshold}")
-
-    # 检验是否显著小于 -threshold
-    print(f"   (b) 检验是否显著小于 {-threshold}:")
-    print(f"       原假设 H0:  mean ≥ {-threshold}")
-    print(f"       备择假设 H1:  mean < {-threshold}")
-    print(f"       t-statistic (NW): {t_stat_lower:.4f}")
-    print(f"       p-value (单尾):   {p_value_lower:.6f}")
-    if significant_lower:
-        print(f"       结论：IC 均值显著小于 {-threshold}")
-    else:
-        print(f"       结论：IC 均值不显著小于 {-threshold}")
-
-    # 最终结论
-    print("-" * 70)
-    print(f"   【综合结论】")
-    if significant_upper:
-        print(f"   IC 均值显著大于 {threshold}（强因子）")
-        threshold_conclusion = "greater_than_threshold"
-    elif significant_lower:
-        print(f"   IC 均值显著小于 {-threshold}（强反向因子）")
-        threshold_conclusion = "less_than_negative_threshold"
-    else:
-        print(f"   IC 均值在 [{-threshold}, {threshold}] 范围内（普通因子或无效）")
-        threshold_conclusion = "within_threshold"
-    print("=" * 70)
+        print("结论：无效因子（不显著）")
+    return {
+        "t_stat": t_stat,
+        "status": status,
+        "mean": sample_mean,
+        "se": se_nw
+    }
 # ─────────────────────────────────────────────────────────────────────────────
 # 嵌套字典，各月份对应的各年度指标，单独独立出来的，便于可视化的前置处理
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,33 +321,56 @@ def monthly_processing(df):
 
     return result_nested_dict_mean, result_nested_dict_icir
 # ─────────────────────────────────────────────────────────────────────────────
-# 可视化Ⅰ:IC & IC_mean & cumulative_IC
+# 可视化Ⅰ: 持有期IC+均值 | 累计IC+柱状 | IC衰减
 # ─────────────────────────────────────────────────────────────────────────────
-def plot_validation_analysis(df):
-    # 提取数据系列
+def plot_validation_analysis(df, ic_decay, test_period):
+   
     rank_ic_series = df.set_index('trade_date')['Rank_IC']
     cumulative_ic_series = df.set_index('trade_date')['Cumulative_IC']
-    ic_ma_period = df.set_index('trade_date')['IC_MA']
-    icir = df['ICIR'].iloc[0] # 提取 ICIR 标量值
+    ic_ma_vals = df.set_index('trade_date')['IC_MA']
+    # 全局指标获取
+    icir = df['ICIR'].iloc[0]
+    max_dd_date_val = df['MaxDD_Occur_Date'].iloc[0]
+    cumu_ic_drawdown_ratio_val = df['Cumulative_IC_MaxDD_Ratio'].iloc[0]
 
-    # 创建子图
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True) # sharex 共享x轴，简化处理
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
+    fig.suptitle(f'IC Analysis (ICIR: {icir:.2f})', fontsize=12, y=1.02)
 
-    # 第一个子图
-    ax1.plot(rank_ic_series.index, rank_ic_series.values, label='Rank IC', color='blue', linewidth=0.8)
-    ax1.plot(rank_ic_series.index, ic_ma_period, label='Rank IC 21MA', color='red', linewidth=1.2)
-    ax1.set_title(f'IC(MA) Analysis (ICIR: {icir:.2f})') # 将ICIR放在标题中，更简洁
+    ax1.plot(rank_ic_series.index, rank_ic_series.values, label=f'Rank IC({test_period}D)', color='blue', linewidth=0.8)
+    ax1.plot(rank_ic_series.index, ic_ma_vals, label='Rank IC MA', color='red', linewidth=1.2)
+    ax1.set_title('Rank IC & Mean')
     ax1.grid(True, linestyle='--', alpha=0.6)
     ax1.legend()
 
-    # 第二个子图
-    ax2.plot(cumulative_ic_series.index, cumulative_ic_series.values, label='Cumulative IC', color='green', linewidth=1.0)
+    ax2.bar(cumulative_ic_series.index, rank_ic_series.values, alpha=0.35, color='steelblue', width=1.5, label='Rank IC')
+    ax2_twin = ax2.twinx()
+    ax2_twin.plot(cumulative_ic_series.index, cumulative_ic_series.values, label='Cumulative IC', color='green', linewidth=1.0)
     ax2.set_title('Cumulative IC')
-    ax2.set_xlabel('Date') # X轴标签只需在最下方设置一次
-    ax2.grid(True, linestyle='--', alpha=0.6)
-    ax2.legend()
+    ax2.set_ylabel('Rank IC')
+    ax2_twin.set_ylabel('Cumulative IC')
 
-    # 自动格式化日期横坐标，无需手动设置刻度
+
+    text_content = f'MaxDD: {cumu_ic_drawdown_ratio_val:.4f} ({cumu_ic_drawdown_ratio_val*100:.2f}%)\nDate: {max_dd_date_val.strftime("%Y-%m-%d")}'
+    ax2.text(0.5, 0.98, text_content, 
+         transform=ax2.transAxes, 
+         fontsize=10, 
+         verticalalignment='top', 
+         horizontalalignment='center')
+
+    ax2.grid(True, linestyle='--', alpha=0.6)
+    ax2.legend(loc='upper left')
+    ax2_twin.legend(loc='upper right')
+
+    horizons = list(range(1, len(ic_decay) + 1))
+    ax3.plot(horizons, ic_decay, 'o-', color='darkorange', linewidth=1.2, markersize=4)
+    ax3.set_title('IC Daily Decay')
+    ax3.set_xlabel('Holding Days')
+    ax3.set_ylabel('Rank IC Mean')
+    ax3.axhline(0, color='gray', linestyle='--', alpha=0.5)
+    ax3.grid(True, linestyle='--', alpha=0.6)
+    step = 5 if len(horizons) > 10 else 1
+    ax3.set_xticks(horizons[::step])
+
     plt.tight_layout()
     plt.show()
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,12 +454,12 @@ def run():
     '''计算因子与未来累计收益排序'''
     df_factor_rank_processed = factor_cumuret_rank(df_initial_preprocess, traget_factor, test_period)
     '''因子有效性相关评价指标'''
-    df_validation_features = IC_calculate(df_factor_rank_processed, ic_ma_period)
+    df_validation_features, ic_decay = IC_calculate(df_factor_rank_processed, ic_ma_period, test_period)
     # print(df_validation_features.head(3))
     '''返回嵌套字典，Rank IC mean & ICIR mean (monthly)可视化的前置操作，单独分出来'''
     result_nested_dict_mean, result_nested_dict_icir = monthly_processing(df_validation_features)
-    '''可视化：Rank IC 21mean & Cumulative Rank IC'''
-    plot_validation_analysis(df_validation_features)
+    '''可视化：持有期IC、累计IC、IC衰减'''
+    plot_validation_analysis(df_validation_features, ic_decay, test_period)
     '''可视化：Rank IC mean & ICIR mean (yearly)'''
     plot_validation_yearly_series_bar(df_validation_features)
     '''可视化：Rank IC mean & ICIR mean (monthly)'''
