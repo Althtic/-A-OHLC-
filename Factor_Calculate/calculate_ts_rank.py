@@ -1,14 +1,18 @@
 import numpy as np
 from numba import njit
 
+
+def calc_ts_rank(series, codes, window):
+    values = np.asarray(series, dtype=np.float64)
+    change = np.where(codes[:-1] != codes[1:])[0] + 1
+    group_starts = np.concatenate(([0], change))
+    group_lengths = np.diff(np.concatenate((group_starts, [len(codes)])))
+    return calc_ts_rank_numba(values, group_starts, group_lengths, window)
+
+
 @njit
-def calc_grouped_rolling_percentile_rank(values, group_starts, group_lengths, window):
-    """
-    values: 所有股票拼接后的长数组 (e.g., [stock1_vals..., stock2_vals...])
-    group_starts: 每只股票在 values 中的起始索引
-    group_lengths: 每只股票的数据长度
-    window: 滚动窗口大小
-    """
+def calc_ts_rank_numba(values, group_starts, group_lengths, window):
+
     n_total = len(values)
     ranks = np.full(n_total, np.nan)
 
