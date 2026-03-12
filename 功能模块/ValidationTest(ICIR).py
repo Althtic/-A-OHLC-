@@ -113,7 +113,6 @@ def factor_cumuret_rank(df, traget_factor, test_period):
     # 未来累计收益排序（升序），用于计算斯皮尔曼相关系数（RankIC）
     # rolling()的计算只能面向“过去”，所以需要提前翻转数据（日期翻转），使得rolling()函数可以直接计算未来收益
     df_factor_ranking = df_factor_ranking.sort_values(by=['trade_date', 'ts_code'], ascending=[False, True])
-   
     # 计算未来持有test_period个交易日的收益累计和
     df_factor_ranking['period_cumu_lndret'] = df_factor_ranking.groupby('ts_code')['lndret'].transform(
         lambda x: x.shift(1).rolling(window = test_period).sum()
@@ -138,6 +137,7 @@ def IC_calculate(df, ic_ma_period, test_period):
     rank_ic_series = df_ic_processing.groupby('trade_date').apply(
         lambda x: x['factor_rank'].corr(x['cumu_lndret_rank']), include_groups=False
     )
+
     # 因子有效性评估
     ic_ttest_sample(rank_ic_series, threshold=0.05)
     # 计算累计IC及最大回撤 
@@ -147,12 +147,15 @@ def IC_calculate(df, ic_ma_period, test_period):
     cumu_ic_max_dd = cumu_ic_drawdown.max()
     max_dd_date = cumu_ic_drawdown.idxmax()
     cumu_ic_drawdown_ratio = cumu_ic_max_dd / cumu_ic_running_max.loc[max_dd_date]
-
-
-   
-    ic_ma_series = rank_ic_series.rolling(window=ic_ma_period, min_periods=test_period).mean()  # 持有期IC的滚动均值
-    ICIR_value = rank_ic_series.mean() / rank_ic_series.std()
-
+    # 计算Rank_IC的均值和标准差
+    rank_ic_series_mean = rank_ic_series.mean()
+    rank_ic_series_std = rank_ic_series.std()
+    ICIR_value = rank_ic_series_mean / rank_ic_series_std
+    # 计算IC胜率
+    ic_win_rate = (rank_ic_series > 0).mean()
+    # 计算IC_MA及均值
+    min_period = int(int(test_period) * 0.6) # 保证窗口计算稳定性(60%)
+    ic_ma_series = rank_ic_series.rolling(window=ic_ma_period, min_periods=min_period).mean()  # 持有期IC的滚动均值
     # IC衰减：各持有期限(1~test_period日)的截面IC均值
     df_desc = df_ic_processing.sort_values(by=['trade_date', 'ts_code'], ascending=[False, True])
     ic_decay = []
@@ -171,12 +174,14 @@ def IC_calculate(df, ic_ma_period, test_period):
     temp_df = pd.DataFrame({
         'trade_date': rank_ic_series.index,
         'Rank_IC': rank_ic_series.values,
+        'Rank_IC_Std': [rank_ic_series_std] * len(rank_ic_series),
         'Cumulative_IC': cumulative_ic_series.values,
         'Cumulative_IC_MaxDD': [cumu_ic_max_dd] * len(rank_ic_series),
         'MaxDD_Occur_Date': [max_dd_date] * len(rank_ic_series), 
         'Cumulative_IC_MaxDD_Ratio': [cumu_ic_drawdown_ratio] * len(rank_ic_series),
         'IC_MA': ic_ma_series.values,
         'ICIR': [ICIR_value] * len(rank_ic_series),
+        'IC_Win_Rate': [ic_win_rate] * len(rank_ic_series),
     })
 
     # 计算每月的 Rank_IC 均值
@@ -303,7 +308,7 @@ def monthly_processing(df):
     # 构建 Monthly_ICIR 的嵌套字典
     result_nested_dict_icir = {}
 
-    for index, row in df.iterrows():
+    for _, row in df.iterrows():
         month = row['month']  # month 已经是 int
         year = row['year']    # year 已经是 int
         mean_value = row['Monthly_Rank_IC_Mean']
@@ -332,6 +337,8 @@ def plot_validation_analysis(df, ic_decay, test_period):
     icir = df['ICIR'].iloc[0]
     max_dd_date_val = df['MaxDD_Occur_Date'].iloc[0]
     cumu_ic_drawdown_ratio_val = df['Cumulative_IC_MaxDD_Ratio'].iloc[0]
+    ic_win_rate_val = df['IC_Win_Rate'].iloc[0]
+    rank_ic_series_std_val = df['Rank_IC_Std'].iloc[0]
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
     fig.suptitle(f'IC Analysis (ICIR: {icir:.2f})', fontsize=12, y=1.02)
@@ -339,8 +346,15 @@ def plot_validation_analysis(df, ic_decay, test_period):
     ax1.plot(rank_ic_series.index, rank_ic_series.values, label=f'Rank IC({test_period}D)', color='blue', linewidth=0.8)
     ax1.plot(rank_ic_series.index, ic_ma_vals, label='Rank IC MA', color='red', linewidth=1.2)
     ax1.set_title('Rank IC & Mean')
+    text_content = f'IC Win Rate: {ic_win_rate_val:.4f} ({ic_win_rate_val*100:.2f}%)\nRank IC Std: {rank_ic_series_std_val:.4f}'
+    ax1.text(0.5, 0.98, text_content, 
+         transform=ax1.transAxes, 
+         fontsize=10, 
+         verticalalignment='top', 
+         horizontalalignment='center')
     ax1.grid(True, linestyle='--', alpha=0.6)
     ax1.legend()
+
 
     ax2.bar(cumulative_ic_series.index, rank_ic_series.values, alpha=0.35, color='steelblue', width=1.5, label='Rank IC')
     ax2_twin = ax2.twinx()
