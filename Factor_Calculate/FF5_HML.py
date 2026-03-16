@@ -29,10 +29,12 @@ def calculate_alpha(data) -> pd.DataFrame:
 
     data = data.copy()
     data = data.sort_values(by=['ts_code', 'trade_date'], ascending=[True, True]).reset_index(drop=True)
-    data_eqy = pd.read_csv(r'C:\Users\63585\Desktop\PycharmProjects\pythonProject\QuantSystem\回测数据集\20170930-20251231_balance_sheet.csv',
+    data_eqy = pd.read_csv(r'C:\Users\63585\Desktop\PycharmProjects\pythonProject\QuantSystem\回测数据集\归母股东权益.csv',
                            usecols=['ts_code', 'trade_date', 'total_hldr_eqy_exc_min_int'],
                            low_memory=False
                            )  # total_hldr_eqy_exc_min_int 归母股东权益
+
+
     data_c = data.merge(data_eqy, how='left', on=['ts_code', 'trade_date'])
     # BM = 归母股东收益（去除少数股东） / 流通总市值
     data_c['BM'] = data_c['total_hldr_eqy_exc_min_int'] / data_c['circ_mv']
