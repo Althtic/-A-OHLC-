@@ -82,7 +82,7 @@ def calculate_alpha(data) -> pd.DataFrame:
         logger.info(f"Error in Final Calculation or Post-processing: {e}")
         raise e
 
-    return_columns = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'industry_name', 'raw_factor', 'alpha_28']
+    return_columns = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'industry_name', 'raw_factor', factor_name]
     return_data = data_c[return_columns]
 
     end_time = time.time()
