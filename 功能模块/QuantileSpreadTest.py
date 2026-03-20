@@ -4,7 +4,6 @@ import warnings
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')  # 设置后端
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from scipy import stats
