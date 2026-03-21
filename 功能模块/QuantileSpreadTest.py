@@ -4,6 +4,7 @@ import warnings
 import pandas as pd
 import numpy as np
 import matplotlib
+matplotlib.use('TkAgg')  # 设置后端
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from scipy import stats
@@ -174,48 +175,70 @@ def spread_ret_cumsum_calculate(data, layers):
 # ─────────────────────────────────────────────────────────────────────────────
 def calculate_turnover_rate(df_processed, layers, holding_period):
     trade_dates = sorted(df_processed['trade_date'].unique())
-    portfolio_history = {}
-    for date in trade_dates:
-        day_data = df_processed[df_processed['trade_date'] == date]
-        portfolio = dict(zip(day_data['ts_code'], day_data['quantile']))
-        portfolio_history[date] = portfolio
+    rebalance_dates = trade_dates[::holding_period]
+    if len(rebalance_dates) < 2:
+        turnover_df = pd.DataFrame()
+        nan = float('nan')
+        group_turnovers = {q: nan for q in range(layers)}
+        return turnover_df, nan, nan, nan, group_turnovers
+    # 只保留所需的目标信息
+    sub = df_processed.loc[
+        df_processed['trade_date'].isin(rebalance_dates), ['trade_date', 'ts_code', 'quantile']
+    ]
+    # 将数据按日期拆解成字典：{日期: 该日期的 [代码, 分层] DataFrame}
+    date_to_sub = {d: g[['ts_code', 'quantile']] for d, g in sub.groupby('trade_date', sort=False)}
 
     rows = []
-    rebalance_dates = trade_dates[::holding_period]
     layer_turnover_sum = np.zeros(layers, dtype=float)
     n_pairs = 0
+    q_idx = np.arange(layers, dtype=np.int16)
 
     for i in range(1, len(rebalance_dates)):
         curr_date = rebalance_dates[i]
         prev_date = rebalance_dates[i - 1]
 
-        curr_portfolio = portfolio_history[curr_date]
-        prev_portfolio = portfolio_history[prev_date]
-        # 合并两个调仓日的所有股票，用于计算换手率的分母
-        all_stocks = set(curr_portfolio.keys()) | set(prev_portfolio.keys())
+         # 获取前后两天的持仓数据，如果某天缺失数据（极端情况），则初始化为空表
+        sub_prev = date_to_sub.get(prev_date)
+        sub_curr = date_to_sub.get(curr_date)
 
-        changes = 0
-        for stock in all_stocks:
-            prev_q = prev_portfolio.get(stock)
-            curr_q = curr_portfolio.get(stock)
-            if prev_q != curr_q:
-                changes += 1
+        if sub_prev is None:
+            sub_prev = pd.DataFrame(columns=['ts_code', 'quantile'])
+        if sub_curr is None:
+            sub_curr = pd.DataFrame(columns=['ts_code', 'quantile'])
+        
+        # 【核心步骤】外连接 (Outer Join)
+        # 将前一天的持仓和后一天的持仓通过 'ts_code' 合并。
+        # 这样可以看到：
+        # 1. 继续持有的股票 (两边都有)
+        # 2. 新买入的股票 (只有当前有，前一边是 NaN)
+        # 3. 卖出的股票 (只有前一天有，后一边是 NaN)
+        merged = sub_prev.merge(sub_curr, on='ts_code', how='outer', suffixes=('_prev', '_curr'))
+        pv = merged['quantile_prev']
+        cv = merged['quantile_curr']
+        n = len(merged)
+        if n == 0:
+            rows.append({'date': curr_date, 'turnover': 0.0, 'changes': 0, 'n_stocks': 0})
+            n_pairs += 1
+            continue
+        # 分层改变 (pv != cv) OR 新买入 (pv is NA) OR 卖出 (cv is NA)
+        changes = int(((pv != cv) | pv.isna() | cv.isna()).sum())
+        turnover = changes / n
+        rows.append({'date': curr_date, 'turnover': turnover, 'changes': changes, 'n_stocks': n})
 
-        turnover = changes / len(all_stocks) if len(all_stocks) > 0 else 0.0
-        rows.append({
-            'date': curr_date,
-            'turnover': turnover,
-            'changes': changes,
-            'n_stocks': len(all_stocks),
-        })
+        pv_arr = pv.astype('float64', copy=False).to_numpy()
+        cv_arr = cv.astype('float64', copy=False).to_numpy()
 
-        for q in range(layers):
-            prev_qset = {s for s, ql in prev_portfolio.items() if ql == q}
-            curr_qset = {s for s, ql in curr_portfolio.items() if ql == q}
-            uni = prev_qset | curr_qset
-            if len(uni) == 0:
-                continue
-            layer_turnover_sum[q] += len(prev_qset ^ curr_qset) / len(uni)
+        # 构建布尔矩阵：
+        # prev_in[i, q] 为 True 表示第 i 只股票在昨天属于第 q 层
+        # curr_in[i, q] 为 True 表示第 i 只股票在今天属于第 q 层
+        # 利用广播机制 (np.newaxis) 进行比较       
+        prev_in = pv_arr[:, np.newaxis] == q_idx
+        curr_in = cv_arr[:, np.newaxis] == q_idx
+        union_mask = prev_in | curr_in
+        uni_counts = union_mask.sum(axis=0)
+        sym_counts = np.logical_xor(prev_in, curr_in).sum(axis=0)
+        valid = uni_counts > 0
+        layer_turnover_sum += np.where(valid, sym_counts.astype(np.float64) / uni_counts, 0.0)
         n_pairs += 1
 
     turnover_df = pd.DataFrame(rows)
@@ -374,7 +397,7 @@ def plot_multiple_return_metrics(dataframe, cumulative_returns, layers, target_f
 # ─────────────────────────────────────────────────────────────────────────────
 # 换手率结果绘图
 # ───────────────────────────────────────────────────────────────────────────── 
-def plot_turnover(turnover_df, group_turnovers, target_factor, layers):
+def plot_turnover(turnover_df, group_turnovers, target_factor, layers, save_dir=None):
     plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
     
@@ -409,7 +432,8 @@ def plot_turnover(turnover_df, group_turnovers, target_factor, layers):
     axes[1].grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, 'Turnover_Rate_result_plot.png'), dpi=150, bbox_inches='tight')
     plt.show()
 
 """ =======================主执行函数======================= """
@@ -450,7 +474,7 @@ def quantile_spread_test():
     t_test_result = t_test_spread_ret(spread_ret_series)
     '''结果绘图'''
     plot_multiple_return_metrics(df_layers_cumulative_ret, final_cumulative_returns, layers, traget_factor, save_dir, t_test_result)
-    plot_turnover(turnover_df, group_turnovers, traget_factor, layers)
+    plot_turnover(turnover_df, group_turnovers, traget_factor, layers, save_dir)
 if __name__ == "__main__":
     quantile_spread_test()
 
