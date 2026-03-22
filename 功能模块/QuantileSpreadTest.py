@@ -117,10 +117,11 @@ def _vw_mean_by_quantile(sorted_group):
     for q, g in sorted_group.groupby('quantile', observed=True):
         w = g['circ_mv'].to_numpy(dtype=np.float64)
         r = g['holding_lndret'].to_numpy(dtype=np.float64)
+        # 只保留市值和收益率都非空且市值大于0的股票
         valid = np.isfinite(w) & (w > 0) & np.isfinite(r)
-        vw_map[q] = np.nan if not valid.any() else float(np.dot(w[valid], r[valid]) / w[valid].sum())
+        # 计算加权平均收益率
+        vw_map[q] = np.nan if not valid.any() else float(np.dot(w[valid], r[valid])) / np.sum(w[valid])
     return sorted_group['quantile'].map(vw_map)
-
 
 def process_group_by_date(group, layers):
     sorted_group = group.sort_values(by=traget_factor, ascending=False).reset_index(drop=True)
@@ -176,16 +177,19 @@ def spread_ret_cumsum_calculate(data, layers, ret_col='mean_lndret', col_suffix=
 
     return Spread_ret, t_test_series, final_cumulative_returns
 # ─────────────────────────────────────────────────────────────────────────────
-# 单边换手率：0.5 * Σ|w_t - w_{t-1}|（多空美元中性，多头合计+0.5、空头合计-0.5）
+# 单边换手率：0.5 * Σ|w_t - w_{t-1}|（多头暴露合计+0.5、空头暴露合计-0.5）
 # ─────────────────────────────────────────────────────────────────────────────
 def _one_way_turnover(w_prev: dict, w_curr: dict) -> float:
+    # 双边金额 Σ|Δw| 中买、卖各算一遍；单边换手率取一半，便于直接 × 单边费率估成本
+    # 合并调仓前与调仓后所有涉及的股票
     keys = set(w_prev.keys()) | set(w_curr.keys())
     if not keys:
         return 0.0
     s = 0.0
     for k in keys:
+        # 计算每只股票的权重变化绝对值后累加
         s += abs(w_curr.get(k, 0.0) - w_prev.get(k, 0.0))
-    return 0.5 * s
+    return 0.5 * s # 单边换手率取一半，便于直接 × 单边费率估成本
 
 
 def _ls_weights_ew(sub: pd.DataFrame, layers: int) -> dict:
@@ -195,10 +199,14 @@ def _ls_weights_ew(sub: pd.DataFrame, layers: int) -> dict:
     if n0 == 0 or ns == 0:
         return {}
     w = {}
+    # 多头组每只股票头寸大小（总多头暴露: +0.5）
     hl = 0.5 / n0
+    # 空头组每只股票头寸大小（总空头暴露: -0.5）
     hs = 0.5 / ns
+    # 多头组合正权重（每只股票 +hl）
     for c in q0:
         w[str(c)] = w.get(str(c), 0.0) + hl
+    # 空头组合负权重（每只股票 -hs）
     for c in qs:
         w[str(c)] = w.get(str(c), 0.0) - hs
     return w
@@ -211,31 +219,37 @@ def _ls_weights_vw(sub: pd.DataFrame, layers: int) -> dict:
     mvs = qs['circ_mv'].to_numpy(dtype=np.float64)
     c0 = q0['ts_code'].astype(str).to_numpy()
     cs = qs['ts_code'].astype(str).to_numpy()
+    # 布尔掩码：市值非空且大于0
     m0 = np.isfinite(mv0) & (mv0 > 0)
     ms = np.isfinite(mvs) & (mvs > 0)
+    # 计算总市值（多头组和空头组）
     s0 = mv0[m0].sum()
     ss = mvs[ms].sum()
     if s0 <= 0 or ss <= 0:
         return {}
     w = {}
-    for i in np.flatnonzero(m0):
+    # 多头/空头各自在层内按 circ_mv 归一化后再 ×0.5，总暴露仍为 +0.5 / -0.5
+    for i in np.flatnonzero(m0): # np.flatnonzero() 只返回市值非空且大于0的股票的索引
+        # 最终头寸 = 当前头寸 + 0.5 * 当前市值 / 总市值
         w[c0[i]] = w.get(c0[i], 0.0) + 0.5 * float(mv0[i]) / s0
     for i in np.flatnonzero(ms):
         w[cs[i]] = w.get(cs[i], 0.0) - 0.5 * float(mvs[i]) / ss
     return w
 
-
+# 独立分析每层的换手情况
 def _layer_weights_ew(sub: pd.DataFrame, q: int) -> dict:
+    # 仅用于「单层、纯多头、等权」口径下的单边换手（柱状图）；权重和为 1
     g = sub[sub['quantile'] == q]
     n = len(g)
     if n == 0:
         return {}
-    hl = 1.0 / n
+    hl = 1.0 / n # 计算等权权重
     return {str(r['ts_code']): hl for _, r in g.iterrows()}
 
 
 def calculate_turnover_rate(df_processed, layers, holding_period):
     trade_dates = sorted(df_processed['trade_date'].unique())
+    # 每隔 holding_period 个交易日调仓一次，只在调仓日用当日截面算权重
     rebalance_dates = trade_dates[::holding_period]
     nan = float('nan')
     if len(rebalance_dates) < 2:
@@ -245,7 +259,9 @@ def calculate_turnover_rate(df_processed, layers, holding_period):
 
     cols = ['trade_date', 'ts_code', 'quantile', 'circ_mv']
     sub = df_processed.loc[df_processed['trade_date'].isin(rebalance_dates), cols]
+    # 将调仓日数据按日期分组，方便后续计算单边换手率
     date_to_sub = {d: g for d, g in sub.groupby('trade_date', sort=False)}
+
 
     rows = []
     layer_turnover_sum = np.zeros(layers, dtype=float)
@@ -265,8 +281,11 @@ def calculate_turnover_rate(df_processed, layers, holding_period):
         if sub_curr is None:
             sub_curr = pd.DataFrame(columns=cols)
 
+        # 当前调仓日截面构建组合，与上一调仓日权重比单边换手（首轮上一档为空 → 相当于建仓换手）
         w_curr_ew = _ls_weights_ew(sub_curr, layers)
         w_curr_vw = _ls_weights_vw(sub_curr, layers)
+
+        # 计算单边换手率
         tow_ew = _one_way_turnover(w_prev_ew, w_curr_ew)
         tow_vw = _one_way_turnover(w_prev_vw, w_curr_vw)
         w_prev_ew, w_prev_vw = w_curr_ew, w_curr_vw
@@ -274,7 +293,7 @@ def calculate_turnover_rate(df_processed, layers, holding_period):
         for q in range(layers):
             lp = layer_prev[q]
             lc = _layer_weights_ew(sub_curr, q)
-            layer_turnover_sum[q] += _one_way_turnover(lp, lc)
+            layer_turnover_sum[q] += _one_way_turnover(lp, lc)  # 各层独立累计，最后再对调仓次数取平均
             layer_prev[q] = lc
 
         rows.append({
@@ -293,12 +312,17 @@ def calculate_turnover_rate(df_processed, layers, holding_period):
     std_ew = turnover_df['turnover_ls_ew'].std()
     avg_vw = turnover_df['turnover_ls_vw'].mean()
     std_vw = turnover_df['turnover_ls_vw'].std()
+    # 每年约 252 个交易日，每 H 日调仓一次 → 年化换手指「每期均单边换手 × 每年期数」
     ann_ew = avg_ew * (252 / holding_period) if holding_period else nan
     ann_vw = avg_vw * (252 / holding_period) if holding_period else nan
     group_turnovers = {
         q: (layer_turnover_sum[q] / n_pairs) if n_pairs else nan
         for q in range(layers)
     }
+    if pd.notna(avg_ew):
+        logger.info(f'多空-等权 平均单边换手率: {avg_ew:.4f}  std: {std_ew:.4f}  年化(×252/H): {ann_ew:.2f}')
+    if pd.notna(avg_vw):
+        logger.info(f'多空-市值加权 平均单边换手率: {avg_vw:.4f}  std: {std_vw:.4f}  年化(×252/H): {ann_vw:.2f}')
 
     return turnover_df, avg_ew, std_ew, ann_ew, avg_vw, std_vw, ann_vw, group_turnovers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,8 +394,7 @@ def t_test_spread_ret(Series, run_label=''):
 # ─────────────────────────────────────────────────────────────────────────────
 def plot_multiple_return_metrics(
     df_ew, cum_ew, df_vw, cum_vw, layers, target_factor,
-    save_dir=None, t_test_ew=None, t_test_vw=None, suffix_ew='_ew', suffix_vw='_vw'
-):
+    save_dir=None, t_test_ew=None, t_test_vw=None, suffix_ew='_ew', suffix_vw='_vw'):
     plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
     fig, axes = plt.subplots(4, 1, figsize=(12, 16))
@@ -417,28 +440,29 @@ def plot_multiple_return_metrics(
         ax.set_xticklabels(xtick_labels, rotation=45)
 
     _bars(ax1, cum_ew)
-    ax1.set_title('等权：各组最终累计收益', fontsize=13, fontweight='bold')
-    _lines(ax2, df_ew, suffix_ew, f'{target_factor} 等权分层多空累计收益')
+    ax1.set_title('等权重：各组最终累计收益', fontsize=13, fontweight='bold')
+    _lines(ax2, df_ew, suffix_ew, f'{target_factor} 等权重分层多空累计收益')
 
     _bars(ax3, cum_vw)
     ax3.set_title('市值加权：各组最终累计收益', fontsize=13, fontweight='bold')
     _lines(ax4, df_vw, suffix_vw, f'{target_factor} 市值加权分层多空累计收益')
 
-    lines_txt = []
+    bbox_kw = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     if t_test_ew:
         te = t_test_ew['t_stat']
-        lines_txt.append(f'等权 [NW] T={te:.4f}  {t_test_ew["conclusion"]}')
+        te_str = f'{te:.4f}' if not np.isnan(te) else 'N/A'
+        ax2.text(
+            0.02, 0.02, f'等权 L-S [NW] T={te_str}\n{t_test_ew["conclusion"]}',
+            transform=ax2.transAxes, fontsize=10, verticalalignment='bottom', bbox=bbox_kw)
     if t_test_vw:
         tv = t_test_vw['t_stat']
-        lines_txt.append(f'市值加权 [NW] T={tv:.4f}  {t_test_vw["conclusion"]}')
-    if lines_txt:
-        fig.text(0.02, 0.01, '\n'.join(lines_txt), fontsize=11, verticalalignment='bottom', transform=fig.transFigure,
-                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        plt.tight_layout(rect=[0, 0.06, 1, 1])
-    else:
-        plt.tight_layout()
+        tv_str = f'{tv:.4f}' if not np.isnan(tv) else 'N/A'
+        ax4.text(
+            0.02, 0.02, f'市值加权 L-S [NW] T={tv_str}\n{t_test_vw["conclusion"]}',
+            transform=ax4.transAxes, fontsize=10, verticalalignment='bottom', bbox=bbox_kw)
+    plt.tight_layout()
     if save_dir:
-        plt.savefig(os.path.join(save_dir, 'Quantile_Spread_Test.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(save_dir, 'Quantile_Spread_result_plot.png'), dpi=150, bbox_inches='tight')
     plt.show()
 # ─────────────────────────────────────────────────────────────────────────────
 # 换手率结果绘图
@@ -490,9 +514,9 @@ def quantile_spread_test():
     df = data_loading(traget_factor)
     if 'circ_mv' not in df.columns:
         raise ValueError("因子数据文件需包含列 circ_mv（当日流通市值）")
+
     df = data_preprocessing(df, test_window_start, test_window_end, holding_period)
     logger.info('数据预处理完毕')
-
     layer_cols = ['trade_date', 'ts_code', traget_factor, 'holding_lndret', 'circ_mv']
     df_layers_processed = (
         df[layer_cols]
@@ -500,27 +524,17 @@ def quantile_spread_test():
         .apply(lambda group: process_group_by_date(group, layers))
         .reset_index(drop=True)
     )
-
-    print(df_layers_processed)
-
     df_ew, spread_ew, cum_ew = spread_ret_cumsum_calculate(df_layers_processed, layers, 'mean_lndret', '_ew')
     df_vw, spread_vw, cum_vw = spread_ret_cumsum_calculate(df_layers_processed, layers, 'mean_lndret_vw', '_vw')
 
-    logger.info('开始换手率分析（单边）...')
-    turnover_df, avg_ew, std_ew, ann_ew, avg_vw, std_vw, ann_vw, group_turnovers = calculate_turnover_rate(
-        df_layers_processed, layers, holding_period)
-
-    if pd.notna(avg_ew):
-        logger.info(f'多空-等权 平均单边换手率: {avg_ew:.4f}  std: {std_ew:.4f}  年化(×252/H): {ann_ew:.2f}')
-    if pd.notna(avg_vw):
-        logger.info(f'多空-市值加权 平均单边换手率: {avg_vw:.4f}  std: {std_vw:.4f}  年化(×252/H): {ann_vw:.2f}')
+    turnover_df, avg_ew, std_ew, ann_ew, avg_vw, std_vw, ann_vw, group_turnovers = calculate_turnover_rate(df_layers_processed, layers, holding_period)
 
     logger.info('分层收益计算完毕')
     t_ew = t_test_spread_ret(spread_ew, run_label='等权L-S')
     t_vw = t_test_spread_ret(spread_vw, run_label='市值加权L-S')
-    plot_multiple_return_metrics(
-        df_ew, cum_ew, df_vw, cum_vw, layers, traget_factor, save_dir, t_ew, t_vw, '_ew', '_vw')
+    plot_multiple_return_metrics(df_ew, cum_ew, df_vw, cum_vw, layers, traget_factor, save_dir, t_ew, t_vw, '_ew', '_vw')
     plot_turnover(turnover_df, group_turnovers, traget_factor, layers, save_dir)
+    
 if __name__ == "__main__":
     quantile_spread_test()
 
