@@ -1,14 +1,19 @@
+import os
+import json
 import logging
 import warnings
 import pandas as pd
 import numpy as np
 import scipy.stats as stats
 import matplotlib
+from scipy.stats.contingency import Chi2ContingencyResult
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from statsmodels.stats.sandwich_covariance import cov_hac
 from config_loader import traget_factor, test_window_start, test_window_end, test_period, ic_ma_period
+import datetime
+
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
@@ -24,6 +29,22 @@ pd.set_option('display.max_columns', None)   # 显示所有列
 pd.set_option('display.width', None)         # 取消换行（字符宽度限制）
 pd.set_option('display.max_colwidth', None)  # 列宽无限制（防止单元格内容被截断）
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON序列化辅助函数
+# ─────────────────────────────────────────────────────────────────────────────
+def json_serializer(obj):
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.strftime('%Y-%m-%d')
+    if isinstance(obj, pd.Period):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 # ─────────────────────────────────────────────────────────────────────────────
 # 加载数据
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,7 +160,7 @@ def IC_calculate(df, ic_ma_period, test_period):
     )
 
     # 因子有效性评估
-    ic_ttest_sample(rank_ic_series, threshold=0.05)
+    ttest_result = ic_ttest_sample(rank_ic_series, threshold=0.05)
     # 计算累计IC及最大回撤 
     cumulative_ic_series = rank_ic_series.cumsum()
     cumu_ic_running_max = cumulative_ic_series.cummax()
@@ -202,7 +223,7 @@ def IC_calculate(df, ic_ma_period, test_period):
     )
     temp_df['Yearly_Rank_IC_Mean'] = temp_df['year'].map(yearly_means)
     temp_df['Yearly_ICIR'] = temp_df['year'].map(yearly_ICIR)
-    return temp_df, ic_decay
+    return temp_df, ic_decay, ttest_result
 # ─────────────────────────────────────────────────────────────────────────────
 # IC序列的t检验（双尾检验), 需同样进行Newey-West调整自相关
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,18 +299,23 @@ def ic_ttest_sample(rank_ic_series, threshold=0.05, alpha=0.05):
     print(f"T-Stat (NW): {t_stat:.4f} | Mean: {sample_mean:.4f} | SE: {se_nw:.4f} | Status: {status}")
     
     if status == "strong_positive":
-        print("结论：强有效正向因子")
+        conclusion = "强有效正向因子"
+        print(f"结论：{conclusion}")
     elif status == "strong_negative":
-        print("结论：强有效反向因子")
+        conclusion = "强有效反向因子"
+        print(f"结论：{conclusion}")
     elif status == "normal":
-        print("结论：普通有效因子（显著异于 0 但未突破阈值）")
+        conclusion = "普通有效因子（显著异于 0 但未突破阈值）"
+        print(f"结论：{conclusion}")
     else:
-        print("结论：无效因子（不显著）")
+        conclusion = "无效因子（不显著）"
+        print(f"结论：{conclusion}")
     return {
         "t_stat": t_stat,
         "status": status,
         "mean": sample_mean,
-        "se": se_nw
+        "se": se_nw,
+        "conclusion": conclusion
     }
 # ─────────────────────────────────────────────────────────────────────────────
 # 嵌套字典，各月份对应的各年度指标，单独独立出来的，便于可视化的前置处理
@@ -309,17 +335,15 @@ def monthly_processing(df):
     result_nested_dict_icir = {}
 
     for _, row in df.iterrows():
-        month = row['month']  # month 已经是 int
-        year = row['year']    # year 已经是 int
+        month = str(row['month'])
+        year = str(row['year'])
         mean_value = row['Monthly_Rank_IC_Mean']
         icir_value = row['Monthly_ICIR']
 
-        # 为 Monthly_Rank_IC_Mean 构建字典
         if month not in result_nested_dict_mean:
             result_nested_dict_mean[month] = {}
         result_nested_dict_mean[month][year] = mean_value
 
-        # 为 Monthly_ICIR 构建字典
         if month not in result_nested_dict_icir:
             result_nested_dict_icir[month] = {}
         result_nested_dict_icir[month][year] = icir_value
@@ -328,8 +352,7 @@ def monthly_processing(df):
 # ─────────────────────────────────────────────────────────────────────────────
 # 可视化Ⅰ: 持有期IC+均值 | 累计IC+柱状 | IC衰减
 # ─────────────────────────────────────────────────────────────────────────────
-def plot_validation_analysis(df, ic_decay, test_period):
-   
+def plot_validation_analysis(df, ic_decay, test_period, save_dir=None, result_dict=None):
     rank_ic_series = df.set_index('trade_date')['Rank_IC']
     cumulative_ic_series = df.set_index('trade_date')['Cumulative_IC']
     ic_ma_vals = df.set_index('trade_date')['IC_MA']
@@ -339,18 +362,16 @@ def plot_validation_analysis(df, ic_decay, test_period):
     cumu_ic_drawdown_ratio_val = df['Cumulative_IC_MaxDD_Ratio'].iloc[0]
     ic_win_rate_val = df['IC_Win_Rate'].iloc[0]
     rank_ic_series_std_val = df['Rank_IC_Std'].iloc[0]
-
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
-    fig.suptitle(f'IC Analysis (ICIR: {icir:.2f})', fontsize=12, y=1.02)
 
     ax1.plot(rank_ic_series.index, rank_ic_series.values, label=f'Rank IC({test_period}D)', color='blue', linewidth=0.8)
     ax1.plot(rank_ic_series.index, ic_ma_vals, label='Rank IC MA', color='red', linewidth=1.2)
     ax1.set_title('Rank IC & Mean')
     text_content = f'IC Win Rate: {ic_win_rate_val:.4f} ({ic_win_rate_val*100:.2f}%)\nRank IC Std: {rank_ic_series_std_val:.4f}'
-    ax1.text(0.5, 0.98, text_content, 
-         transform=ax1.transAxes, 
-         fontsize=10, 
-         verticalalignment='top', 
+    ax1.text(0.5, 0.98, text_content,
+         transform=ax1.transAxes,
+         fontsize=10,
+         verticalalignment='top',
          horizontalalignment='center')
     ax1.grid(True, linestyle='--', alpha=0.6)
     ax1.legend()
@@ -365,10 +386,10 @@ def plot_validation_analysis(df, ic_decay, test_period):
 
 
     text_content = f'MaxDD: {cumu_ic_drawdown_ratio_val:.4f} ({cumu_ic_drawdown_ratio_val*100:.2f}%)\nDate: {max_dd_date_val.strftime("%Y-%m-%d")}'
-    ax2.text(0.5, 0.98, text_content, 
-         transform=ax2.transAxes, 
-         fontsize=10, 
-         verticalalignment='top', 
+    ax2.text(0.5, 0.98, text_content,
+         transform=ax2.transAxes,
+         fontsize=10,
+         verticalalignment='top',
          horizontalalignment='center')
 
     ax2.grid(True, linestyle='--', alpha=0.6)
@@ -386,20 +407,35 @@ def plot_validation_analysis(df, ic_decay, test_period):
     ax3.set_xticks(horizons[::step])
 
     plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, 'IC_Analysis.png'), dpi=150, bbox_inches='tight')
+    if result_dict is not None:
+        result_dict['ic_analysis'] = {
+            'rank_ic_series': [{'date': str(k), 'value': v} for k, v in rank_ic_series.items()],
+            'cumulative_ic': [{'date': str(k), 'value': v} for k, v in cumulative_ic_series.items()],
+            'ic_decay': ic_decay,
+            'icir': icir,
+            'max_dd_date': str(max_dd_date_val),
+            'max_dd_ratio': cumu_ic_drawdown_ratio_val,
+            'ic_win_rate': ic_win_rate_val,
+            'ic_std': rank_ic_series_std_val
+        }
     plt.show()
 # ─────────────────────────────────────────────────────────────────────────────
 # 可视化Ⅱ:Yearly IC_mean & ICIR
 # ─────────────────────────────────────────────────────────────────────────────
-def plot_validation_yearly_series_bar(df):
+def plot_validation_yearly_series_bar(df, save_dir=None, ttest_result=None, result_dict=None):
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
     yearly_data = df.sort_values(by='year').copy()
     # 提取 'year' 列的唯一值，并转换为字符串列表
     years = yearly_data['year'].unique().astype(str).tolist()
     # 提取 Yearly_ICIR 和 Rank_IC_Mean 值
     icir_values = yearly_data['Yearly_ICIR'].unique().tolist()
     rank_ic_mean_values = yearly_data['Yearly_Rank_IC_Mean'].unique().tolist()
-    
+
     fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-    
+
     # --- 左图：ICIR ---
     bars0 = axs[0].bar(years, icir_values)
     axs[0].set_title('ICIR')
@@ -410,7 +446,7 @@ def plot_validation_yearly_series_bar(df):
     # 添加数值标签 (保留2位小数)
     for bar in bars0:
         height = bar.get_height()
-        axs[0].text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}', 
+        axs[0].text(bar.get_x() + bar.get_width()/2, height, f'{height:.2f}',
                     ha='center', va='bottom', fontsize=10)
 
     # --- 右图：IC Mean ---
@@ -423,18 +459,39 @@ def plot_validation_yearly_series_bar(df):
     # 添加数值标签 (保留4位小数，因为IC通常较小)
     for bar in bars1:
         height = bar.get_height()
-        axs[1].text(bar.get_x() + bar.get_width()/2, height, f'{height:.4f}', 
+        axs[1].text(bar.get_x() + bar.get_width()/2, height, f'{height:.4f}',
                     ha='center', va='bottom', fontsize=10)
 
-    plt.tight_layout()
+
+    if ttest_result:
+        t_stat = ttest_result['t_stat']
+        sample_mean = ttest_result['mean']
+        se_nw = ttest_result['se']
+        status = ttest_result['status']
+        conclusion = ttest_result['conclusion']
+        txt = f"T-Stat (NW): {t_stat:.4f} | Mean: {sample_mean:.4f} | SE: {se_nw:.4f} | Status: {status}\nConclusion: {conclusion}"
+        fig.text(0.02, 0.02, txt, fontsize=10, verticalalignment='bottom', transform=fig.transFigure,
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        plt.tight_layout(rect=[0, 0.08, 1, 1])
+    else:
+        plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, 'Yearly_IC_ICIR.png'), dpi=150, bbox_inches='tight')
+    if result_dict is not None:
+        result_dict['yearly_ic_icir'] = {
+            'years': years,
+            'icir_values': icir_values,
+            'rank_ic_mean_values': rank_ic_mean_values,
+            'ttest_result': ttest_result
+        }
     plt.show()
 # ─────────────────────────────────────────────────────────────────────────────
-# 可视化Ⅲ:Monthly & IC_mean & ICIR
+# 可视化Ⅲ:Monthly & IC_mean & ICIR 热力图
 # ─────────────────────────────────────────────────────────────────────────────
-def plot_validation_monthly_series_bar(dict1, dict2):
+def plot_validation_monthly_series_bar(dict1, dict2, save_dir=None, result_dict=None):
     result_nested_dict_mean = dict1
     result_nested_dict_icir = dict2
-    months = list(range(1, 13))
+    months = [str(m) for m in range(1, 13)]
     years = set()
 
     for month_year_values in [result_nested_dict_mean, result_nested_dict_icir]:
@@ -442,42 +499,69 @@ def plot_validation_monthly_series_bar(dict1, dict2):
             years.update(year_values.keys())
 
     years = sorted(years)
-    fig, axs = plt.subplots(1, 2, figsize=(15, 6))
+    fig, axs = plt.subplots(2, 1, figsize=(12, 8))
     for idx, (title, data_dict) in enumerate(
             [("Rank IC Mean", result_nested_dict_mean), ("ICIR", result_nested_dict_icir)]):
         ax = axs[idx]
-        for i, year in enumerate(years):
-            values = [data_dict.get(month, {}).get(year, 0) for month in months]
-            ax.bar([m + i * 0.1 for m in months], values, width=0.1, label=str(year))
+        data = np.array([[data_dict.get(month, {}).get(str(year), np.nan) for month in months] for year in years])
+        vmin, vmax = (np.nanmin(data), np.nanmax(data)) if not np.all(np.isnan(data)) else (0, 1)
+        im = ax.imshow(data, aspect='auto', cmap='RdYlGn', vmin=vmin, vmax=vmax)
+        for i in range(len(years)):
+            for j in range(12):
+                val = data[i, j]
+                txt = f'{val:.4f}' if not np.isnan(val) else ''
+                ax.text(j, i, txt, ha='center', va='center', fontsize=8)
+        ax.set_xticks(range(12))
+        ax.set_xticklabels([int(m) for m in months])
+        ax.set_yticks(range(len(years)))
+        ax.set_yticklabels(years)
         ax.set_xlabel('Month')
-        ax.set_ylabel('Value')
+        ax.set_ylabel('Year')
         ax.set_title(title)
-        ax.set_xticks([m + 0.1 * (len(years) - 1) / 2 for m in months])
-        ax.set_xticklabels(months)
-        ax.legend()
-        ax.yaxis.grid(True, linestyle='--', alpha=0.6)
+        plt.colorbar(im, ax=ax)
     plt.tight_layout()
+    if save_dir:
+        plt.savefig(os.path.join(save_dir, 'Monthly_IC_ICIR.png'), dpi=150, bbox_inches='tight')
+    if result_dict is not None:
+        # 直接将写成矩阵格式，方便deepseek分析
+        rank_ic_matrix = np.array([[result_nested_dict_mean.get(month, {}).get(str(year), np.nan) for month in months] for year in years]).tolist()
+        icir_matrix = np.array([[result_nested_dict_icir.get(month, {}).get(str(year), np.nan) for month in months] for year in years]).tolist()
+        result_dict['monthly_ic_icir'] = {
+            'years': years,
+            'months': [int(m) for m in months],
+            'rank_ic_mean_matrix': rank_ic_matrix,
+            'icir_matrix': icir_matrix
+        }
     plt.show()
 # ─────────────────────────────────────────────────────────────────────────────
 # 主运行函数
 # ─────────────────────────────────────────────────────────────────────────────
-def run():
+def validation_test():
+    save_dir = os.path.join(r'C:\Users\63585\Desktop\PycharmProjects\pythonProject\QuantSystem\因子检验结果', traget_factor)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
     df = data_loading(traget_factor)
     '''数据加载与预处理'''
     df_initial_preprocess = data_preprocessing(df, test_window_start, test_window_end)
     '''计算因子与未来累计收益排序'''
     df_factor_rank_processed = factor_cumuret_rank(df_initial_preprocess, traget_factor, test_period)
     '''因子有效性相关评价指标'''
-    df_validation_features, ic_decay = IC_calculate(df_factor_rank_processed, ic_ma_period, test_period)
+    df_validation_features, ic_decay, ttest_result = IC_calculate(df_factor_rank_processed, ic_ma_period, test_period)
     # print(df_validation_features.head(3))
     '''返回嵌套字典，Rank IC mean & ICIR mean (monthly)可视化的前置操作，单独分出来'''
     result_nested_dict_mean, result_nested_dict_icir = monthly_processing(df_validation_features)
+
+    result_dict = {'target_factor': traget_factor}
     '''可视化：持有期IC、累计IC、IC衰减'''
-    plot_validation_analysis(df_validation_features, ic_decay, test_period)
+    plot_validation_analysis(df_validation_features, ic_decay, test_period, save_dir, result_dict)
     '''可视化：Rank IC mean & ICIR mean (yearly)'''
-    plot_validation_yearly_series_bar(df_validation_features)
+    plot_validation_yearly_series_bar(df_validation_features, save_dir, ttest_result, result_dict)
     '''可视化：Rank IC mean & ICIR mean (monthly)'''
-    plot_validation_monthly_series_bar(result_nested_dict_mean, result_nested_dict_icir)
+    plot_validation_monthly_series_bar(result_nested_dict_mean, result_nested_dict_icir, save_dir, result_dict)
+
+    json_path = os.path.join(save_dir, 'validation_test_result.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(result_dict, f, ensure_ascii=False, indent=2, default=json_serializer)
 
 if __name__ == "__main__":
     '''
@@ -486,7 +570,7 @@ if __name__ == "__main__":
             绝对值 > 0.1：非常强的预测能力（这种因子很少见，通常很快会被市场消化）。
             ICIR 的绝对值大于 0.5 通常被视为具备一定预测能力，而大于 2 则被视为统计显著的优质因子
     '''
-    run()
+    validation_test()
 
 
 
