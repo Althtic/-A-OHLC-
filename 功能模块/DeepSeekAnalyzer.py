@@ -2,7 +2,7 @@ import os
 import json
 import requests
 
-API_KEY = "sk-3dd3717d2b914b95802e7949062f76fd"
+API_KEY = "Your API Key"
 API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 def load_validation_result(json_path):
